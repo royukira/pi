@@ -27,6 +27,7 @@ import type { AuthInput } from "../cli/experimental/command-options.ts";
 import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
 import { CoordinatorConnection, type CoordinatorStartupLease, ensureCoordinator } from "./coordinator.ts";
+import { createDiagnosticLogger } from "./diagnostics.ts";
 import { createPresentationFacetData } from "./plugins/bundled.ts";
 import {
 	createServerPluginPackage,
@@ -360,6 +361,8 @@ interface StartServerBackendOptions {
 	readonly path: string;
 	readonly serverId: ServerId;
 	readonly sessionDir?: string;
+	/** Structured trace for Session routing (attach/release), backed by the diagnostics log. */
+	readonly trace?: (event: string, data?: Record<string, unknown>) => void;
 	resolveSessionPlugins(
 		metadata: JsonlSessionMetadata,
 		packagePaths: readonly string[] | undefined,
@@ -475,6 +478,11 @@ async function startServerBackend(
 		path: socketPath,
 		mode: 0o600,
 		onConnectionCountChanged,
+		trace: options.trace,
+		onError: (error) => {
+			// Surface silent relay failures (dropped updates, encode errors, transport faults).
+			console.error(`[pi-server] ${error.message}`);
+		},
 	});
 	try {
 		await server.start();
@@ -614,14 +622,19 @@ export async function startServer(options: StartServerOptions = {}): Promise<Run
 		startupLease = await ensureCoordinator(socketPath, controlPath);
 		coordinator = new CoordinatorConnection({ controlPath, endpoint: serverPath });
 		const sessionDir = resolveSessionDirectory(options.sessionDir);
-		workers = new SessionWorkerManager(coordinator, sessionDir, workerModel, (count) =>
-			lifetime.setWorkerCount(count),
+		workers = new SessionWorkerManager(
+			coordinator,
+			sessionDir,
+			workerModel,
+			(count) => lifetime.setWorkerCount(count),
+			{ diagnosticsDir: directory },
 		);
 		backend = await startServerBackend(
 			{
 				path: serverPath,
 				serverId,
 				sessionDir: options.sessionDir,
+				trace: createDiagnosticLogger("session-router", directory, { echo: true }),
 				resolveSessionPlugins,
 				removeSessionPlugins,
 				reloadPresentationFacetBundles,

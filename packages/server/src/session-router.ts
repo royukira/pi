@@ -29,6 +29,7 @@ interface SessionRouterOptions<TMetadata extends SessionMetadata> {
 	isClosing: () => boolean;
 	publishAttachment(client: object, attachment: SessionTarget | undefined, context: Context): Promise<void>;
 	reportError: (error: unknown) => void;
+	trace?: (event: string, data?: Record<string, unknown>) => void;
 }
 
 export class SessionRouter<TMetadata extends SessionMetadata = SessionMetadata> {
@@ -161,6 +162,11 @@ export class SessionRouter<TMetadata extends SessionMetadata = SessionMetadata> 
 		if (this.options.isClosing() || this.disconnectedClients.has(client)) throw new ServerDrainingError();
 		const current = this.attachmentsByClient.get(client);
 		if (current?.session.id === sessionId) return;
+		this.options.trace?.("client_attach_start", {
+			sessionId,
+			clientId: client instanceof Object && "id" in client ? String((client as { id: unknown }).id) : undefined,
+			hadPrevious: current !== undefined,
+		});
 		const hosted = await this.acquire(sessionId, context);
 		if (this.options.isClosing() || this.disconnectedClients.has(client)) throw new ServerDrainingError();
 		if (current) await this.releaseAttachment(current, context, false);
@@ -177,6 +183,11 @@ export class SessionRouter<TMetadata extends SessionMetadata = SessionMetadata> 
 			attachment.lease = await acquiring;
 		} catch (error) {
 			hosted.attachments.delete(attachment);
+			this.options.trace?.("client_attach_failed", {
+				sessionId,
+				attachmentId: attachment.id,
+				error: error instanceof Error ? error.message : String(error),
+			});
 			throw error;
 		}
 		if (
@@ -194,6 +205,11 @@ export class SessionRouter<TMetadata extends SessionMetadata = SessionMetadata> 
 			{ serverId: this.options.serverId, sessionId, attachmentId: attachment.id },
 			context,
 		);
+		this.options.trace?.("client_attach_ok", {
+			sessionId,
+			attachmentId: attachment.id,
+			sessionAttachments: hosted.attachments.size,
+		});
 	}
 
 	private async startServiceCall(
@@ -253,6 +269,11 @@ export class SessionRouter<TMetadata extends SessionMetadata = SessionMetadata> 
 
 	private async clearAttachment(attachment: ClientAttachment, context: Context, publish: boolean): Promise<void> {
 		attachment.session.attachments.delete(attachment);
+		this.options.trace?.("client_attach_release", {
+			sessionId: attachment.session.id,
+			attachmentId: attachment.id,
+			remainingAttachments: attachment.session.attachments.size,
+		});
 		if (this.attachmentsByClient.get(attachment.client) === attachment) {
 			this.attachmentsByClient.delete(attachment.client);
 			if (publish) await this.options.publishAttachment(attachment.client, undefined, context);

@@ -84,6 +84,7 @@ export class Server<TMetadata extends SessionMetadata = SessionMetadata> {
 				});
 			},
 			reportError: (error) => this.reportError(error),
+			trace: options.trace,
 		});
 		this.closed = new Promise((resolve, reject) => {
 			this.resolveClosed = resolve;
@@ -441,7 +442,10 @@ export class Server<TMetadata extends SessionMetadata = SessionMetadata> {
 		update: ServiceProviderUpdate,
 	): Promise<void> {
 		const stateEncoder = connection.serviceStateEncoders.get(subscriptionId);
-		if (stateEncoder === undefined) return;
+		if (stateEncoder === undefined) {
+			this.reportError(new Error(`Dropping service update for subscription ${subscriptionId}: no active encoder`));
+			return;
+		}
 		await this.sendMessage(connection, {
 			type: "service_update",
 			subscriptionId,

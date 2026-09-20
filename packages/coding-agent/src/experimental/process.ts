@@ -1,5 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { join, resolve } from "node:path";
+import { closeSync, mkdirSync, openSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { getPackageDir, isBunBinary, isBundledNode } from "../config.ts";
 
@@ -35,6 +36,8 @@ export function consumeInternalProcessRole(): InternalProcessRole | undefined {
 export interface InternalProcessSpawnOptions {
 	readonly entryUrl?: URL;
 	readonly env?: NodeJS.ProcessEnv;
+	/** Append child stderr to this file instead of discarding it. */
+	readonly stderrFile?: string;
 }
 
 /** Spawn a detached Pi-owned process consistently across Node and compiled Bun. */
@@ -50,23 +53,34 @@ export function spawnInternalProcess(
 	const sourceRuntimeArgs = import.meta.url.endsWith(".ts")
 		? ["--import", fileURLToPath(new URL("source-resolver.ts", import.meta.url))]
 		: [];
-	const child = spawn(
-		process.execPath,
-		isBunBinary ? [...args] : [...sourceRuntimeArgs, fileURLToPath(entryUrl), ...args],
-		{
-			cwd: process.cwd(),
-			detached: true,
-			env: {
-				...process.env,
-				...options.env,
-				[INTERNAL_PROCESS_ENV]: role,
+	let stderrFd: number | undefined;
+	let stdio: ["ignore", "ignore", "ignore" | number] = ["ignore", "ignore", "ignore"];
+	if (options.stderrFile !== undefined && !isBunBinary) {
+		mkdirSync(dirname(options.stderrFile), { recursive: true });
+		stderrFd = openSync(options.stderrFile, "a");
+		stdio = ["ignore", "ignore", stderrFd];
+	}
+	try {
+		const child = spawn(
+			process.execPath,
+			isBunBinary ? [...args] : [...sourceRuntimeArgs, fileURLToPath(entryUrl), ...args],
+			{
+				cwd: process.cwd(),
+				detached: true,
+				env: {
+					...process.env,
+					...options.env,
+					[INTERNAL_PROCESS_ENV]: role,
+				},
+				stdio,
+				windowsHide: true,
 			},
-			stdio: "ignore",
-			windowsHide: true,
-		},
-	);
-	child.unref();
-	return child;
+		);
+		child.unref();
+		return child;
+	} finally {
+		if (stderrFd !== undefined) closeSync(stderrFd);
+	}
 }
 
 /** Force a spawned internal process to exit and wait until it can no longer take ownership. */

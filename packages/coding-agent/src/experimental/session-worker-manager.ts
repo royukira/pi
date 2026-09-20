@@ -18,6 +18,12 @@ import {
 import { type RoutedSessionAttachment, type RoutedSessionHandle, ServerError } from "@earendil-works/pi-server";
 import { Check } from "typebox/value";
 import type { CoordinatorConnection, CoordinatorConnectionEvent } from "./coordinator.ts";
+import {
+	createDiagnosticLogger,
+	type DiagnosticLogger,
+	diagnosticsLogPath,
+	noopDiagnosticLogger,
+} from "./diagnostics.ts";
 import { spawnInternalProcess } from "./process.ts";
 import {
 	SESSION_WORKER_CONTROL_ADDRESS_ENV,
@@ -111,6 +117,8 @@ export class SessionWorkerManager {
 	readonly #serviceSubscriptions = new Map<string, WorkerServiceSubscription>();
 	readonly #removeListener: () => void;
 	readonly #onWorkerCountChanged: ((count: number) => void) | undefined;
+	readonly #diagnosticsDir: string | undefined;
+	readonly #log: DiagnosticLogger;
 	#discoveryPeers?: Set<string>;
 	#resolveDiscovery?: () => void;
 	#detached = false;
@@ -124,11 +132,18 @@ export class SessionWorkerManager {
 		sessionDir: string,
 		model?: { readonly provider?: string; readonly model: string },
 		onWorkerCountChanged?: (count: number) => void,
+		options?: { readonly diagnosticsDir?: string },
 	) {
 		this.#coordinator = coordinator;
 		this.#sessionDir = sessionDir;
 		this.#model = model;
 		this.#onWorkerCountChanged = onWorkerCountChanged;
+		const diagnosticsDir = options?.diagnosticsDir;
+		this.#diagnosticsDir = diagnosticsDir;
+		this.#log =
+			diagnosticsDir === undefined
+				? noopDiagnosticLogger
+				: createDiagnosticLogger("session-worker-manager", diagnosticsDir, { echo: true });
 		this.#removeListener = coordinator.onEvent((event) => this.#handleCoordinatorEvent(event));
 	}
 
@@ -183,9 +198,16 @@ export class SessionWorkerManager {
 		if (this.#detached || this.#shuttingDown) throw new Error("Experimental server is shutting down");
 		this.assertSessionPluginManifestPaths(metadata, pluginManifestPaths);
 		const existing = this.#workersBySession.get(metadata.path);
-		if (existing) return this.#routedHandle(existing);
+		if (existing) {
+			this.#log("session_open_reused", {
+				sessionId: metadata.id,
+				attachments: existing.attachmentIds.size,
+			});
+			return this.#routedHandle(existing);
+		}
 		const pending = this.#pending.get(metadata.path);
 		if (pending) return this.#routedHandle(await pending.promise);
+		this.#log("session_open_launch", { sessionId: metadata.id });
 		return this.#routedHandle(await this.#launch(metadata, context, pluginManifestPaths));
 	}
 
@@ -210,13 +232,28 @@ export class SessionWorkerManager {
 			throw new Error("Experimental Session worker is no longer available");
 		}
 		const attachmentId = randomUUID();
+		this.#log("attach_start", {
+			sessionId: worker.metadata.id,
+			attachmentId,
+			attachments: worker.attachmentIds.size,
+		});
 		worker.attachmentIds.add(attachmentId);
 		try {
 			await this.#applyDemand(worker, attachmentId, true, true, context);
 		} catch (error) {
 			worker.attachmentIds.delete(attachmentId);
+			this.#log("attach_failed", {
+				sessionId: worker.metadata.id,
+				attachmentId,
+				error: error instanceof Error ? error.message : String(error),
+			});
 			throw error;
 		}
+		this.#log("attach_applied", {
+			sessionId: worker.metadata.id,
+			attachmentId,
+			attachments: worker.attachmentIds.size,
+		});
 		const scope = this.#operationScope(worker, attachmentId);
 		let released = false;
 		return {
@@ -232,6 +269,11 @@ export class SessionWorkerManager {
 					if (!this.#detached && !this.#coordinator.wasReplaced) throw error;
 				} finally {
 					worker.attachmentIds.delete(attachmentId);
+					this.#log("attach_release", {
+						sessionId: worker.metadata.id,
+						attachmentId,
+						attachments: worker.attachmentIds.size,
+					});
 					this.#removeServiceSubscriptions((entry) => entry.worker === worker && sameScope(entry.scope, scope));
 				}
 			},
@@ -480,6 +522,9 @@ export class SessionWorkerManager {
 					[SESSION_WORKER_SESSION_KEY_ENV]: Buffer.from(sessionKey).toString("base64url"),
 					[SESSION_WORKER_PEER_ID_ENV]: peerId,
 				},
+				...(this.#diagnosticsDir === undefined
+					? {}
+					: { stderrFile: diagnosticsLogPath(this.#diagnosticsDir, `session-worker-${metadata.id}`) }),
 			});
 		} catch (error) {
 			return Promise.reject(error);
@@ -566,6 +611,12 @@ export class SessionWorkerManager {
 			}
 			this.#pendingDemand.delete(message.requestId);
 			clearTimeout(pending.timer);
+			this.#log(message.type === "demand_applied" ? "worker_demand_applied" : "worker_demand_rejected", {
+				sessionId: pending.worker.metadata.id,
+				attachmentId: pending.attachmentId,
+				attached: pending.attached,
+				...(message.type === "demand_rejected" ? { message: message.message } : {}),
+			});
 			if (message.type === "demand_applied") pending.resolve();
 			else pending.reject(new Error(`Session worker rejected demand: ${message.message}`));
 			return;
@@ -603,6 +654,10 @@ export class SessionWorkerManager {
 			response.scope.serverConnectionId !== pending.scope.serverConnectionId ||
 			response.scope.attachmentId !== pending.scope.attachmentId
 		) {
+			this.#log("operation_response_mismatch", {
+				sessionKey,
+				requestId: response.requestId,
+			});
 			this.#rejectOperation(
 				response.requestId,
 				new Error("Session worker returned a mismatched operation response"),
@@ -638,15 +693,30 @@ export class SessionWorkerManager {
 			entry.worker.metadata.path !== sessionKey ||
 			!sameScope(entry.scope, scope)
 		) {
+			this.#log("service_update_dropped", {
+				sessionKey,
+				subscriptionId,
+				updateType: (update as { type?: unknown }).type,
+			});
 			return;
 		}
 		let parsed: ServiceProviderUpdate;
 		try {
 			parsed = parseServiceProviderUpdate(update);
 		} catch {
+			this.#log("service_update_parse_failed", { sessionKey, subscriptionId });
 			return;
 		}
-		entry.deliveryTail = entry.deliveryTail.then(() => entry.listener(parsed, TODO_CONTEXT)).catch(() => {});
+		entry.deliveryTail = entry.deliveryTail
+			.then(() => entry.listener(parsed, TODO_CONTEXT))
+			.catch((error: unknown) => {
+				this.#log("service_update_forward_failed", {
+					sessionId: entry.worker.metadata.id,
+					subscriptionId,
+					updateType: parsed.type,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			});
 	}
 
 	#recordReadyWorker(peerId: string, message: Extract<SessionWorkerEvent, { type: "worker_ready" }>): void {
@@ -695,6 +765,12 @@ export class SessionWorkerManager {
 		this.#workersBySession.set(message.sessionKey, worker);
 		this.#workersByPeer.set(peerId, worker);
 		this.workerPids.set(message.sessionId, message.pid);
+		this.#log("worker_ready", {
+			sessionId: message.sessionId,
+			pid: message.pid,
+			peerId,
+			pluginManifestPaths: message.pluginManifestPaths,
+		});
 		if (pending) {
 			this.#pending.delete(message.sessionKey);
 			clearTimeout(pending.timer);
@@ -704,6 +780,12 @@ export class SessionWorkerManager {
 	}
 
 	#childExited(pending: PendingLaunch, code: number | null, signal: NodeJS.Signals | null): void {
+		this.#log("worker_exit", {
+			sessionKey: pending.sessionKey,
+			pid: pending.child.pid,
+			code,
+			signal,
+		});
 		if (this.#pending.get(pending.sessionKey) === pending) {
 			this.#failPending(
 				pending.sessionKey,
@@ -725,6 +807,7 @@ export class SessionWorkerManager {
 	#failPending(sessionKey: string, error: Error): void {
 		const pending = this.#pending.get(sessionKey);
 		if (!pending) return;
+		this.#log("worker_launch_failed", { sessionKey, error: error.message });
 		this.#pending.delete(sessionKey);
 		clearTimeout(pending.timer);
 		this.#notifyWorkerCountChanged();
@@ -757,6 +840,11 @@ export class SessionWorkerManager {
 	async #reconcileDemandTimeout(requestId: string): Promise<void> {
 		const pending = this.#pendingDemand.get(requestId);
 		if (!pending) return;
+		this.#log("demand_timeout", {
+			sessionId: pending.worker.metadata.id,
+			attachmentId: pending.attachmentId,
+			attached: pending.attached,
+		});
 		this.#pendingDemand.delete(requestId);
 		clearTimeout(pending.timer);
 		const timeoutError = new Error("Session worker demand update timed out");
@@ -787,6 +875,11 @@ export class SessionWorkerManager {
 
 	#removeWorker(worker: WorkerRecord, error: Error | undefined): void {
 		if (this.#workersByPeer.get(worker.peerId) !== worker) return;
+		this.#log("worker_removed", {
+			sessionId: worker.metadata.id,
+			pid: worker.pid,
+			reason: error?.message ?? "expected stop",
+		});
 		this.#rejectWorkerOperations(worker, new Error("Session worker disconnected during an operation"));
 		this.#removeServiceSubscriptions((entry) => entry.worker === worker);
 		for (const pending of [...this.#pendingDemand.values()]) {

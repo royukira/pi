@@ -55,7 +55,6 @@ export interface RunClientTuiOptions extends OpenClientRuntimeOptions {
 
 export interface ClientTuiServer {
 	readonly serverId: string;
-	readonly radius: boolean;
 	readonly server: ServerServiceSource;
 	readonly session: SessionServiceSource;
 }
@@ -299,14 +298,12 @@ export class ExperimentalClientTui implements Component {
 						if (this.#controller === controller) this.#controller = undefined;
 					});
 					env.own(commands.subscribe(() => this.#updateAutocomplete()));
-					if (server.radius) {
-						env.own(
-							server.server.connection.subscribe((state) => this.#handleConnectionState(server.serverId, state)),
-						);
-						env.own(
-							server.session.attachment.subscribe((state) => this.#handleAttachmentState(sessionFeature, state)),
-						);
-					}
+					env.own(
+						server.server.connection.subscribe((state) => this.#handleConnectionState(server.serverId, state)),
+					);
+					env.own(
+						server.session.attachment.subscribe((state) => this.#handleAttachmentState(sessionFeature, state)),
+					);
 				});
 			},
 		});
@@ -455,7 +452,7 @@ export class ExperimentalClientTui implements Component {
 			return;
 		}
 		this.#busy = true;
-		this.#status = state.status === "connecting" ? "Reconnecting to Radius…" : "Radius disconnected; retrying…";
+		this.#status = state.status === "connecting" ? "Reconnecting…" : "Server disconnected; retrying…";
 		this.#queueRecovery(() => this.#closeLane());
 		this.#rebuild();
 	}
@@ -474,6 +471,18 @@ export class ExperimentalClientTui implements Component {
 		if (state.status === "attaching" && state.sessionId === this.#sessionId) {
 			this.#busy = true;
 			this.#status = "Reattaching Session…";
+			this.#rebuild();
+			return;
+		}
+		if (state.status === "degraded" && state.sessionId === this.#sessionId) {
+			this.#busy = true;
+			this.#status = "Session services degraded; updates may be missing";
+			this.#rebuild();
+			return;
+		}
+		if (state.status === "detached") {
+			this.#busy = true;
+			this.#status = `Session ${this.#sessionId} was detached unexpectedly`;
 			this.#rebuild();
 		}
 	}
@@ -770,7 +779,6 @@ export async function runClientTui(command: ClientCommand, options: RunClientTui
 			ui: tui,
 			servers: runtime.servers.map((server) => ({
 				serverId: server.route.serverId,
-				radius: server.route.transport === "radius",
 				server: server.server,
 				session: server.session,
 			})),

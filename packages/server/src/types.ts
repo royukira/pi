@@ -10,6 +10,8 @@ export interface ServerOptions {
 	handshakeTimeoutMs?: number;
 	onConnectionCountChanged?: (count: number) => void;
 	onError?: (error: Error) => void;
+	/** Optional structured trace for Session routing events (attach/release), used for diagnostics. */
+	trace?: (event: string, data?: Record<string, unknown>) => void;
 }
 
 export type MaybePromise<T> = T | Promise<T>;

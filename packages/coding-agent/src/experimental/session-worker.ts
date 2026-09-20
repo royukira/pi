@@ -32,6 +32,7 @@ import { findInitialModel, resolveCliModel } from "../core/model-resolver.ts";
 import { ModelRuntime } from "../core/model-runtime.ts";
 import { SettingsManager } from "../core/settings-manager.ts";
 import { COORDINATOR_PROTOCOL_VERSION } from "./coordinator.ts";
+import { findNonJsonValuePath } from "./diagnostics.ts";
 import { createSessionPluginFacetLoader } from "./plugins/bundled.ts";
 import {
 	consumeInternalProcessRole,
@@ -456,9 +457,29 @@ function writeJsonLine(socket: Socket, message: unknown): Promise<void> {
 	});
 }
 
-function toWorkerServiceUpdate(update: ServiceProviderUpdate): ServiceProviderUpdate {
-	if (!isJsonValue(update)) throw new Error("Service produced a non-JSON update");
-	return parseServiceProviderUpdate(update);
+export function toWorkerServiceUpdate(update: ServiceProviderUpdate): ServiceProviderUpdate {
+	if (isJsonValue(update)) return parseServiceProviderUpdate(update);
+	// Producers may build plain objects carrying explicit `undefined` properties,
+	// which JSON.stringify drops on the wire anyway. Normalize once at the boundary
+	// so updates only fail when they carry genuinely non-JSON data.
+	const normalized = stripUndefinedProperties(update);
+	if (!isJsonValue(normalized)) throw new Error("Service produced a non-JSON update");
+	return parseServiceProviderUpdate(normalized);
+}
+
+function stripUndefinedProperties(value: unknown): unknown {
+	if (Array.isArray(value)) {
+		return value.map((item) =>
+			item === undefined ? null : typeof item === "object" && item !== null ? stripUndefinedProperties(item) : item,
+		);
+	}
+	if (typeof value !== "object" || value === null || Object.getPrototypeOf(value) !== Object.prototype) return value;
+	const normalized: Record<string, unknown> = {};
+	for (const [key, item] of Object.entries(value)) {
+		if (item === undefined) continue;
+		normalized[key] = stripUndefinedProperties(item);
+	}
+	return normalized;
 }
 
 function demandKey(serverConnectionId: string, attachmentId: string): string {
@@ -552,15 +573,34 @@ async function run(options: SessionWorkerOptions, createHarness: CreateSessionWo
 			modelRuntime: runtime.modelRuntime,
 			settingsManager: runtime.settingsManager,
 			facetLoader: runtime.facetLoader,
-			publish: (scope, subscriptionId, update) =>
-				control.send({
-					type: "service_update",
-					token,
-					sessionKey,
-					scope,
-					subscriptionId,
-					update: toWorkerServiceUpdate(update),
-				}),
+			publish: (scope, subscriptionId, update): Promise<void> => {
+				let payload: ServiceProviderUpdate;
+				try {
+					payload = toWorkerServiceUpdate(update);
+				} catch (error) {
+					console.error(
+						`[session-worker] service_update ${subscriptionId} is not JSON-serializable:`,
+						error instanceof Error ? error.message : error,
+						`| first offending path: ${findNonJsonValuePath(update)}`,
+					);
+					return Promise.resolve();
+				}
+				return control
+					.send({
+						type: "service_update",
+						token,
+						sessionKey,
+						scope,
+						subscriptionId,
+						update: payload,
+					})
+					.catch((error: unknown) => {
+						console.error(
+							`[session-worker] failed to publish service_update ${subscriptionId}:`,
+							error instanceof Error ? error.message : error,
+						);
+					});
+			},
 		});
 	} catch (error) {
 		try {
@@ -691,6 +731,9 @@ async function run(options: SessionWorkerOptions, createHarness: CreateSessionWo
 		onShutdown: closeAndExit,
 		onDiscovery: announce,
 		onDemand: async (command) => {
+			console.error(
+				`[session-worker ${sessionId}] demand ${command.attached ? "attach" : "detach"} attachmentId=${command.attachmentId}`,
+			);
 			const releaseRetirement = lifecycle?.holdRetirement() ?? (() => {});
 			try {
 				try {
